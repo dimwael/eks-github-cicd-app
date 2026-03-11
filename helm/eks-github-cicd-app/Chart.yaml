@@ -1,0 +1,6 @@
+apiVersion: v2
+name: eks-github-cicd-app
+description: Simple Python FastAPI app with fault injection for EKS troubleshooting
+type: application
+version: 0.1.0
+appVersion: "dev"

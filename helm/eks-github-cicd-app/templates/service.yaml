@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "eks-github-cicd-app.fullname" . }}
+  labels:
+    {{- include "eks-github-cicd-app.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "eks-github-cicd-app.selectorLabels" . | nindent 4 }}
