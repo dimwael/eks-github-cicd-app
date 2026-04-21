@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS cluster, ECR registry, and IAM roles for eks-github-cicd-app'
+
+# Parameters are grouped for readability in the CloudFormation console.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Cluster configuration
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+      - Label:
+          default: Node group configuration
+        Parameters:
+          - NodeInstanceType
+          - NodeDesiredCapacity
+          - NodeMinSize
+          - NodeMaxSize
+      - Label:
+          default: Networking
+        Parameters:
+          - SubnetIds
+      - Label:
+          default: GitHub Actions OIDC
+        Parameters:
+          - GitHubOrg
+          - GitHubRepo
+          - GitHubOIDCProviderArn
+    ParameterLabels:
+      ClusterName:
+        default: EKS cluster name
+      KubernetesVersion:
+        default: Kubernetes version
+      NodeInstanceType:
+        default: Worker node EC2 instance type
+      NodeDesiredCapacity:
+        default: Desired node count
+      NodeMinSize:
+        default: Minimum node count
+      NodeMaxSize:
+        default: Maximum node count
+      SubnetIds:
+        default: Subnets for cluster and node group (>= 2 AZs)
+      GitHubOrg:
+        default: GitHub organization or user
+      GitHubRepo:
+        default: GitHub repository name
+      GitHubOIDCProviderArn:
+        default: GitHub Actions OIDC provider ARN
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: eks-github-cicd-app
+    Description: Name of the EKS cluster and related resources.
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.30'
+    AllowedValues:
+      - '1.29'
+      - '1.30'
+      - '1.31'
+    Description: Kubernetes control plane version for the EKS cluster.
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for the managed node group workers.
+
+  NodeDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of worker nodes.
+
+  NodeMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of worker nodes.
+
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum number of worker nodes.
+
+  GitHubOrg:
+    Type: String
+    Default: dimwael
+    Description: GitHub organization or user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: eks-github-cicd-app
+    Description: GitHub repository name allowed to assume the Deployer role via OIDC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the EKS cluster control plane and managed node group. Must span at least two Availability Zones.
+
+  GitHubOIDCProviderArn:
+    Type: String
+    Description: ARN of the IAM OIDC identity provider for token.actions.githubusercontent.com (created by infra/bootstrap-oidc.sh).
+
+Resources:
+
+  # Service role assumed by the EKS control plane to manage the cluster
+  # (create ENIs, call AWS APIs on behalf of the cluster, etc.).
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # Node_IAM_Role: attached to the managed node group worker EC2 instances.
+  # Grants nodes permission to join the cluster, pull images from ECR (via
+  # AmazonEC2ContainerRegistryReadOnly), and manage ENIs for pod networking.
+  # ECR image pulls happen at the kubelet level using this role -- no IRSA
+  # is required for the application ServiceAccount.
+  NodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+  # EKS control plane. Public and private endpoint access are both enabled so
+  # the GitHub Actions runner can reach the API and so in-VPC clients can use
+  # the private endpoint.
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !Ref SubnetIds
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+
+  # Managed node group that runs the application pods. Uses the standard
+  # Amazon Linux 2 x86_64 EKS-optimized AMI.
+  EksNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodeRole: !GetAtt NodeInstanceRole.Arn
+      Subnets: !Ref SubnetIds
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeMinSize
+        DesiredSize: !Ref NodeDesiredCapacity
+        MaxSize: !Ref NodeMaxSize
+      AmiType: AL2_x86_64
+
+  # ECR repository that holds the application container images. Scanning on
+  # push is enabled and images are encrypted at rest with AES-256.
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ClusterName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  # Deployer_IAM_Role: assumed by the GitHub Actions pipeline via OIDC.
+  # Trust policy restricts assumption to workflows running in the configured
+  # repository. Inline policies grant just enough to deploy this stack,
+  # push images to the ECR repo, and run helm upgrade against the cluster.
+  DeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-deployer'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:*'
+      Policies:
+        # Deploy/update/describe the CloudFormation stack that owns this
+        # infrastructure. DescribeStacks and ValidateTemplate are scoped to
+        # * because they operate on the service, not on a specific stack.
+        - PolicyName: CloudFormationDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*/*'
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: '*'
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+
+        # Push and pull container images to/from the ECR repo created above.
+        - PolicyName: EcrPushPull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepository.Arn
+
+        # Read cluster details so `aws eks update-kubeconfig` works.
+        - PolicyName: EksAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+
+        # Allow CFN to pass the cluster and node roles to their respective
+        # services when creating or updating the stack.
+        - PolicyName: IamPassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt EksClusterRole.Arn
+                  - !GetAtt NodeInstanceRole.Arn
+
+        # Let CFN manage the IAM roles it created on stack updates. Scoped
+        # to roles whose name starts with the cluster name so the Deployer
+        # role cannot touch unrelated roles in the account.
+        - PolicyName: IamManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:TagRole
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ClusterName}-*'
+
+        # Read-only EC2 describe calls are needed for VPC/subnet/security
+        # group lookups during stack deploys.
+        - PolicyName: Ec2Describe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:Describe*
+                Resource: '*'
+
+        # Manage the EKS cluster and its node groups on stack updates.
+        - PolicyName: NodegroupManage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: eks:*
+                Resource:
+                  - !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+                  - !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/${ClusterName}/*/*'
+
+        # Manage the ECR repository itself (create on first deploy, update
+        # scanning/lifecycle configuration on subsequent deploys).
+        - PolicyName: EcrRepoManage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:PutLifecyclePolicy
+                  - ecr:PutImageScanningConfiguration
+                  - ecr:TagResource
+                Resource: !GetAtt EcrRepository.Arn
+
+Outputs:
+
+  EcrRepositoryUri:
+    Description: URI of the ECR repository used by the Application_Job for docker push.
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-EcrRepositoryUri'
+
+  EcrRepositoryArn:
+    Description: ARN of the ECR repository.
+    Value: !GetAtt EcrRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EcrRepositoryArn'
+
+  EksClusterName:
+    Description: Name of the EKS cluster used by the Application_Job for helm upgrade.
+    Value: !Ref EksCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EksClusterName'
+
+  EksClusterArn:
+    Description: ARN of the EKS cluster.
+    Value: !GetAtt EksCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EksClusterArn'
+
+  DeployerRoleArn:
+    Description: ARN of the Deployer IAM role assumed by GitHub Actions via OIDC.
+    Value: !GetAtt DeployerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployerRoleArn'
+
+  NodeInstanceRoleArn:
+    Description: ARN of the Node_IAM_Role attached to the managed node group.
+    Value: !GetAtt NodeInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeInstanceRoleArn'

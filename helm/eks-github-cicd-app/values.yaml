@@ -33,6 +33,11 @@ readinessProbe:
   periodSeconds: 5
   failureThreshold: 3
 
+# ECR image pulls are authenticated via the Node_IAM_Role (managed node group
+# instance profile) at the kubelet level, so this ServiceAccount does NOT
+# require IRSA annotations. The `annotations` field is retained as an empty
+# dict only so operators can opt in later (e.g., add
+# `eks.amazonaws.com/role-arn` if the pod ever needs to call AWS APIs directly).
 serviceAccount:
   create: true
   annotations: {}

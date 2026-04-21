@@ -2,16 +2,19 @@
 
 ## Overview
 
-This document describes the design for a simple HTTP web service built in Python, containerized with Docker, deployed to Amazon EKS via a GitHub Actions CI/CD pipeline using Helm, and instrumented with fault injection endpoints for DevOps troubleshooting practice.
+This document describes the design for a simple HTTP web service built in Python, containerized with Docker, deployed to Amazon EKS via a two-job GitHub Actions CI/CD pipeline using Helm, and instrumented with fault injection endpoints for DevOps troubleshooting practice.
 
 The application is intentionally minimal — its primary purpose is to be a realistic, observable target for practicing EKS operations, not to implement business logic. The fault injection system is the most interesting part: it lets operators trigger real failure modes (OOMKill, CrashLoopBackOff, latency, unhealthy probes) on demand.
+
+The pipeline is split into two sequential jobs: the **Infrastructure_Job** reconciles AWS infrastructure (EKS cluster, ECR registry, IAM roles) declaratively via a single CloudFormation stack, and the **Application_Job** builds, pushes, and deploys the application via Helm. Application_Job runs only if Infrastructure_Job succeeds.
 
 **Technology choices:**
 - Language: Python 3.12 — wide ecosystem, excellent stdlib, easy to produce a slim container
 - HTTP framework: FastAPI — async-capable, automatic request validation, minimal boilerplate
 - ASGI server: Uvicorn — production-grade, supports graceful shutdown
 - Container base: `python:3.12-slim` — minimal Debian-based image, no unnecessary packages
-- Helm for Kubernetes packaging — standard, supports values overrides, works well with GitOps
+- Helm for Kubernetes packaging — standard, supports values overrides, atomic rollback on failure
+- Infrastructure as Code: CloudFormation — native AWS, declarative, automatic rollback on failed updates
 - GitHub Actions with OIDC — no long-lived credentials, uses `aws-actions/configure-aws-credentials`
 - Prometheus text format for `/metrics` — no external dependency, compatible with AWS Managed Prometheus
 - Property-based testing: Hypothesis — mature Python PBT library with rich strategy support
@@ -23,11 +26,25 @@ The application is intentionally minimal — its primary purpose is to be a real
 ```mermaid
 graph TD
     Dev[Developer] -->|git push main| GHA[GitHub Actions]
-    GHA -->|OIDC auth| AWS[AWS IAM]
-    AWS -->|assume role| GHA
-    GHA -->|docker build + push| ECR[Amazon ECR]
-    GHA -->|helm upgrade| EKS[Amazon EKS]
-    EKS -->|pull image via IRSA| ECR
+    GHA -->|OIDC auth| IAM[AWS IAM]
+    IAM -->|assume Deployer_IAM_Role| GHA
+
+    subgraph Pipeline["GitHub Actions Pipeline"]
+        InfraJob[Infrastructure_Job<br/>cloudformation deploy]
+        AppJob[Application_Job<br/>docker + helm]
+        InfraJob -->|success| AppJob
+    end
+
+    GHA --> InfraJob
+    InfraJob -->|create/update| CFN[CloudFormation Stack]
+    CFN -->|manages| EKS[Amazon EKS Cluster]
+    CFN -->|manages| ECR[Amazon ECR Repository]
+    CFN -->|manages| NodeRole[Node_IAM_Role]
+    CFN -->|manages| DeployerRole[Deployer_IAM_Role]
+
+    AppJob -->|docker build + push| ECR
+    AppJob -->|helm upgrade --atomic| EKS
+    EKS -->|pull image via Node_IAM_Role| ECR
     EKS -->|runs| Pod[Application Pod]
     Pod -->|stdout JSON logs| CW[CloudWatch Logs]
     Pod -->|/metrics| Prom[Prometheus / AMP]
@@ -40,16 +57,40 @@ graph TD
 sequenceDiagram
     participant Dev
     participant GHA as GitHub Actions
+    participant CFN as CloudFormation
     participant ECR
     participant EKS
 
     Dev->>GHA: push to main
-    GHA->>GHA: checkout + pytest
+    Note over GHA: Infrastructure_Job
+    GHA->>GHA: OIDC → assume Deployer_IAM_Role
+    GHA->>CFN: aws cloudformation deploy (eks-cicd-stack.yaml)
+    CFN->>CFN: create/update EKS, ECR, IAM roles
+    CFN-->>GHA: stack outputs (ECR URI, cluster name)
+
+    Note over GHA: Application_Job (only on infra success)
     GHA->>GHA: docker build (tag: SHA)
     GHA->>ECR: docker push
-    GHA->>EKS: helm upgrade --install (image.tag=SHA)
-    EKS->>ECR: pull image (via IRSA)
+    GHA->>EKS: helm upgrade --install --atomic --timeout 10m
+    EKS->>ECR: pull image (via Node_IAM_Role)
     EKS->>EKS: rolling update
+    alt helm fails to reach ready
+        EKS->>EKS: auto-rollback to previous release
+        GHA-->>Dev: report failure
+    end
+```
+
+### Pull Request Flow (no infra, no deploy)
+
+```mermaid
+sequenceDiagram
+    participant Dev
+    participant GHA as GitHub Actions (ci.yml)
+
+    Dev->>GHA: open PR against main
+    GHA->>GHA: checkout + setup-python
+    GHA->>GHA: pip install + pytest
+    GHA-->>Dev: pass / fail status check
 ```
 
 ### Fault Injection State Machine
@@ -88,7 +129,7 @@ eks-github-cicd-app/
 │   ├── test_fault.py         # Unit tests for FaultController
 │   ├── test_logger.py        # Unit tests for log output shape
 │   ├── test_metrics.py       # Unit tests for metrics format
-│   └── test_properties.py   # Property-based tests (Hypothesis)
+│   └── test_properties.py    # Property-based tests (Hypothesis)
 ├── helm/
 │   └── eks-github-cicd-app/
 │       ├── Chart.yaml
@@ -97,13 +138,59 @@ eks-github-cicd-app/
 │           ├── deployment.yaml
 │           ├── service.yaml
 │           └── serviceaccount.yaml
+├── infra/
+│   ├── cloudformation/
+│   │   └── eks-cicd-stack.yaml   # Single CFN template: EKS, ECR, IAM roles
+│   └── bootstrap-oidc.sh         # One-time local run: GitHub OIDC provider + Deployer_IAM_Role
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml       # PR: build + test only
-│       └── cd.yml       # main push: build, push ECR, helm deploy
+│       └── cd.yml       # main push: Infrastructure_Job → Application_Job
 ├── Dockerfile
 └── requirements.txt
 ```
+
+### Infrastructure as Code — CloudFormation Stack
+
+A single CloudFormation template (`infra/cloudformation/eks-cicd-stack.yaml`) declares all AWS resources required to run the application. The **Infrastructure_Job** deploys this stack on every push to `main`; CloudFormation reconciles drift idempotently and rolls back automatically on failed updates.
+
+**Stack name:** `eks-github-cicd-app-stack`
+
+**Resources declared in the template:**
+
+| Logical ID | Type | Purpose |
+|---|---|---|
+| `EksClusterRole` | `AWS::IAM::Role` | Service role assumed by the EKS control plane (`AmazonEKSClusterPolicy`) |
+| `NodeInstanceRole` | `AWS::IAM::Role` | **Node_IAM_Role** — attached to the managed node group, grants worker nodes permission to join the cluster, pull images from ECR, and manage ENIs |
+| `EksCluster` | `AWS::EKS::Cluster` | The EKS control plane (Kubernetes 1.30) |
+| `EksNodeGroup` | `AWS::EKS::Nodegroup` | Managed node group (2× `t3.medium`, min 1, max 4) using `NodeInstanceRole` |
+| `EcrRepository` | `AWS::ECR::Repository` | **ECR_Registry** — image scanning on push, AES-256 encryption |
+| `DeployerRole` | `AWS::IAM::Role` | **Deployer_IAM_Role** — assumed by GitHub Actions via OIDC; updated by this stack to grant `cloudformation:*` on this stack, `ecr:*` on the repo, and `eks:DescribeCluster` on the cluster |
+
+**Note on the GitHub OIDC provider and initial Deployer_IAM_Role:** The OIDC provider (`token.actions.githubusercontent.com`) and the minimal initial Deployer_IAM_Role must exist *before* the first pipeline run (the pipeline itself assumes this role). These are created by a one-time bootstrap script, `infra/bootstrap-oidc.sh`, run locally by the operator. Subsequent updates to the Deployer_IAM_Role's permissions are managed by the CloudFormation stack.
+
+**Node_IAM_Role managed policies:**
+- `AmazonEKSWorkerNodePolicy`
+- `AmazonEC2ContainerRegistryReadOnly` — grants `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` so pods scheduled on these nodes can pull images from ECR. **No IRSA is required for image pulls** — image pulling happens at the kubelet level using the node's instance profile.
+- `AmazonEKS_CNI_Policy`
+
+**Stack outputs:**
+
+| Output | Description | Consumed by |
+|---|---|---|
+| `EcrRepositoryUri` | Full URI of the ECR repo (e.g. `649976227195.dkr.ecr.us-east-1.amazonaws.com/eks-github-cicd-app`) | Application_Job (docker tag + push) |
+| `EksClusterName` | Name of the EKS cluster | Application_Job (`aws eks update-kubeconfig`) |
+| `DeployerRoleArn` | ARN of the Deployer_IAM_Role | GitHub repo secret `AWS_ROLE_ARN` |
+
+### Bootstrap Script — `infra/bootstrap-oidc.sh`
+
+A one-time script run locally by the operator *before* the first pipeline run. It replaces the previous `04-create-github-oidc-role.sh`. Responsibilities:
+
+1. Create the IAM OIDC identity provider for `token.actions.githubusercontent.com` (idempotent — skips if already exists).
+2. Create a minimal Deployer_IAM_Role with a trust policy scoped to `repo:dimwael/eks-github-cicd-app:*`, with inline permissions sufficient to deploy the CloudFormation stack (`cloudformation:*` on the stack, `iam:PassRole`, `iam:CreateRole`, `iam:AttachRolePolicy`, etc.).
+3. Output the role ARN to set as the GitHub repo secret `AWS_ROLE_ARN`.
+
+Once the first pipeline run succeeds and the CFN stack is created, the stack itself manages the full Deployer_IAM_Role permission set going forward. The bootstrap script is idempotent and safe to re-run.
 
 ### Application Entry Point (`app/main.py`)
 
@@ -281,8 +368,32 @@ readinessProbe:
   periodSeconds: 5
 
 serviceAccount:
-  annotations:
-    eks.amazonaws.com/role-arn: ""
+  create: true
+```
+
+Note: because ECR image pulls are authenticated via the Node_IAM_Role (attached to the managed node group instance profile), the application ServiceAccount does **not** require IRSA annotations. The `serviceAccount.annotations` field is retained in `values.yaml` only for future use (e.g., if the application later needs to call AWS APIs directly).
+
+### CloudFormation Stack Outputs Schema
+
+```yaml
+Outputs:
+  EcrRepositoryUri:
+    Description: URI of the ECR repository
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryUri"
+
+  EksClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EksCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-EksClusterName"
+
+  DeployerRoleArn:
+    Description: ARN of the Deployer IAM role for GitHub Actions
+    Value: !GetAtt DeployerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeployerRoleArn"
 ```
 
 ---
@@ -387,6 +498,14 @@ Uvicorn handles `SIGTERM`/`SIGINT` and drains in-flight requests before exit (co
 
 FastAPI returns HTTP 404 for unregistered paths. The `RequestLoggingMiddleware` still captures and logs these requests.
 
+### Infrastructure_Job failure (Requirement 3.3)
+
+The Infrastructure_Job runs `aws cloudformation deploy` with `--no-fail-on-empty-changeset`. CloudFormation automatically rolls back failed stack updates to the previous known-good state (Requirement 11.4). The GitHub Actions job step exits with a non-zero code if the `deploy` call fails, and the workflow's job-level `needs:` dependency causes the Application_Job to be skipped entirely.
+
+### Application_Job Helm deployment failure (Requirement 3.7)
+
+The `helm upgrade --install` command is invoked with `--atomic --timeout 10m`, which instructs Helm to automatically roll back to the previously deployed release if the new release fails to reach a ready state within 10 minutes. The job step exits with a non-zero code; GitHub Actions marks the run as failed and preserves the logs for inspection.
+
 ---
 
 ## Testing Strategy
@@ -431,3 +550,18 @@ A `pytest` marker `@pytest.mark.integration` starts a real Uvicorn server on a r
 ### Helm Chart Tests
 
 Use `helm template` + `helm lint` in CI to render the chart with various `--set` overrides and pipe output through `yq` assertions. This validates Property 12 without requiring a live cluster.
+
+### CloudFormation / Infrastructure Testing
+
+The CloudFormation stack is declarative infrastructure — not suitable for property-based testing. Instead:
+
+- **Template linting:** `cfn-lint infra/cloudformation/eks-cicd-stack.yaml` runs in the CI job to catch syntax and best-practice violations before the pipeline ever deploys.
+- **Idempotency is inherent to CloudFormation:** re-running `aws cloudformation deploy` against an unchanged template produces no-op change sets (Requirement 11.3). This is a guarantee of the CloudFormation service, not logic we need to test ourselves.
+- **Automatic rollback on failure** (Requirement 11.4) is also a built-in CloudFormation behavior and does not require custom testing.
+- **Smoke test after deploy:** The Application_Job's final step waits for Helm's `--atomic` rollout to succeed; this implicitly verifies that the stack's outputs are correct and the ECR/EKS resources are wired up properly.
+
+### CI/CD Pipeline Testing
+
+- The `ci.yml` workflow (PR check) runs unit and property tests only, with no AWS credentials or deployment steps.
+- The `cd.yml` workflow (main push) runs the Infrastructure_Job and Application_Job sequentially. Job dependencies (`needs: infrastructure`) ensure Application_Job is skipped if infrastructure fails.
+- No property-based testing for the pipeline itself — GitHub Actions job behavior is deterministic infrastructure. A successful end-to-end run serves as the integration test.

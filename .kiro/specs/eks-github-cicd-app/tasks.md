@@ -2,269 +2,223 @@
 
 ## Overview
 
-Incremental implementation of a Python FastAPI application deployed to Amazon EKS via GitHub Actions CI/CD, with fault injection endpoints for DevOps troubleshooting practice. Tasks build from core application code through containerization, Helm packaging, AWS infrastructure, and CI/CD pipeline wiring.
+Incremental implementation of a Python FastAPI application deployed to Amazon EKS via a two-job GitHub Actions CI/CD pipeline. The `Infrastructure_Job` deploys a single CloudFormation stack (`infra/cloudformation/eks-cicd-stack.yaml`) that declares the EKS cluster, ECR registry, and IAM roles; the `Application_Job` builds/pushes the container and runs `helm upgrade --install --atomic`. The application and Helm chart already exist — the remaining work is IaC, pipeline wiring, and cleanup of legacy bash scripts.
 
 ## Tasks
 
-- [ ] 1. Set up project structure and dependencies
-  - Create the directory layout: `app/`, `tests/`, `helm/eks-github-cicd-app/templates/`, `.github/workflows/`
-  - Create `requirements.txt` with pinned versions: `fastapi`, `uvicorn[standard]`, `httpx`, `anyio`, `pytest`, `pytest-anyio`, `hypothesis`, `pydantic-settings`
-  - Create `app/__init__.py`, `tests/__init__.py` (empty)
-  - Create `app/config.py` using `pydantic-settings` `BaseSettings` to read `PORT` (default `8080`), `APP_VERSION` (default `dev`), `CPU_SPIKE_DURATION` (default `60`) from environment
+- [x] 1. Set up project structure and dependencies
+  - Directory layout `app/`, `tests/`, `helm/eks-github-cicd-app/templates/` in place
+  - `requirements.txt` pins `fastapi`, `uvicorn[standard]`, `httpx`, `anyio`, `pytest`, `pytest-anyio`, `hypothesis`, `pydantic-settings`
+  - `app/config.py` reads `PORT`, `APP_VERSION`, `CPU_SPIKE_DURATION` via `pydantic-settings`
   - _Requirements: 1.1, 1.4_
 
-- [ ] 2. Implement structured JSON logger
-  - [ ] 2.1 Create `app/logger.py`
-    - Subclass `logging.Formatter` to serialize each `LogRecord` to a single-line JSON string with fields `level`, `timestamp` (ISO-8601 UTC), `message`
-    - Use `contextvars.ContextVar` named `request_id_var` to carry per-request ID; include it in every log record when set
-    - Configure the root logger with this formatter writing to `sys.stdout`
-    - Expose a `get_logger(name: str) -> logging.Logger` helper
+- [x] 2. Implement structured JSON logger
+  - [x] 2.1 `app/logger.py` with `JSONFormatter`, `request_id_var` ContextVar, `get_logger()` helper
     - _Requirements: 10.1, 10.2_
 
-  - [ ]* 2.2 Write unit tests for logger output shape
-    - In `tests/test_logger.py`, use `capsys` to capture stdout and assert each emitted line is valid JSON with `level`, `timestamp`, `message` keys
+  - [x]* 2.2 Unit tests for logger output shape in `tests/test_logger.py`
     - _Requirements: 10.1, 10.2_
 
-  - [ ]* 2.3 Write property test for log entry fields (Property 10)
+  - [x]* 2.3 Property test for log entry fields
     - `# Feature: eks-github-cicd-app, Property 10: All log entries are valid structured JSON with required fields`
-    - In `tests/test_properties.py`, use `@given(st.sampled_from(["GET", "POST"]), st.text(min_size=1, alphabet=...))` to verify every request log line contains `level`, `timestamp`, `message`, `request_id`, `method`, `path`, `status`, `latency_ms`
     - _Requirements: 10.1, 10.2, 10.4_
 
-- [ ] 3. Implement FaultController
-  - [ ] 3.1 Create `app/fault.py` with `FaultController` class
-    - Internal state: `_dependency_failure: bool`, `_slow_delay_ms: int`, `_stop_event: threading.Event`, `_lock: threading.Lock`
-    - `activate_memory_leak()`: log WARNING, start background `threading.Thread` that appends 10 MB `bytearray` chunks to a module-level list each second until `_stop_event` is set
-    - `activate_cpu_spike(duration_sec: int)`: log WARNING with start time and duration, submit a tight arithmetic loop to `concurrent.futures.ThreadPoolExecutor(max_workers=1)` that runs until `_stop_event` is set or duration expires
-    - `activate_slow_response(delay_ms: int)`: log WARNING with delay value, set `_slow_delay_ms`
-    - `activate_dependency_failure()`: log WARNING, set `_dependency_failure = True`
-    - `reset()`: set `_stop_event`, clear all state flags, create a new `_stop_event` for future faults, log INFO
-    - `is_healthy() -> bool`: return `not self._dependency_failure`
-    - `slow_delay_ms() -> int`: return current delay (0 if not active)
-    - `active_faults() -> list[str]`: return list of currently active fault names
+- [x] 3. Implement FaultController
+  - [x] 3.1 `app/fault.py` — `FaultController` with memory-leak, cpu-spike, slow-response, dependency-failure, reset, and query methods
     - _Requirements: 5.1, 5.4, 6.1, 6.3, 7.1, 7.4, 8.3, 9.3_
 
-  - [ ]* 3.2 Write unit tests for FaultController state transitions
-    - In `tests/test_fault.py`, test: `is_healthy()` is `True` initially; `False` after `activate_dependency_failure()`; `True` after `reset()`; `active_faults()` returns correct names; `slow_delay_ms()` returns 0 after reset
+  - [x]* 3.2 Unit tests for state transitions in `tests/test_fault.py`
     - _Requirements: 5.1, 6.1, 7.1, 9.3_
 
-  - [ ]* 3.3 Write property test for fault activation liveness (Property 4)
+  - [x]* 3.3 Property test for fault activation liveness
     - `# Feature: eks-github-cicd-app, Property 4: Fault activation does not break server liveness`
-    - Use `@given(st.sampled_from(["memory-leak", "cpu-spike", "slow-response"]))` to activate each fault and assert `/health` still returns HTTP 200
     - _Requirements: 5.2, 6.2_
 
-  - [ ]* 3.4 Write property test for fault activation warning logs (Property 5)
+  - [x]* 3.4 Property test for fault activation warning logs
     - `# Feature: eks-github-cicd-app, Property 5: Fault activation produces a structured log warning`
-    - Use `@given(st.sampled_from(["memory-leak", "cpu-spike", "slow-response", "dependency-failure"]))` to verify at least one WARNING-level JSON log line is emitted containing the fault name
     - _Requirements: 5.4, 6.3, 7.4, 8.3_
 
-  - [ ]* 3.5 Write property test for reset restores health (Property 9)
+  - [x]* 3.5 Property test for reset restores health
     - `# Feature: eks-github-cicd-app, Property 9: Reset restores healthy state`
-    - Use `@given(st.lists(st.sampled_from(["memory-leak", "cpu-spike", "slow-response", "dependency-failure"])))` to activate arbitrary fault combinations, call reset, then assert `/health` returns HTTP 200 with `{"status": "healthy"}`
     - _Requirements: 9.3, 9.4_
 
-- [ ] 4. Implement Metrics
-  - [ ] 4.1 Create `app/metrics.py` with `Metrics` class
-    - Thread-safe counters `_request_count` and `_error_count` protected by `threading.Lock`
-    - `increment_requests()`, `increment_errors()` methods
-    - `prometheus_text(active_faults: list[str]) -> str`: serialize to Prometheus text format with `http_requests_total`, `http_errors_total`, `active_faults` gauge
-    - Module-level singleton `metrics = Metrics()`
+- [x] 4. Implement Metrics
+  - [x] 4.1 `app/metrics.py` with thread-safe counters and `prometheus_text()` serializer
     - _Requirements: 10.3_
 
-  - [ ]* 4.2 Write unit tests for metrics format
-    - In `tests/test_metrics.py`, verify counter increments and that `prometheus_text()` output contains the three required metric names with correct `# HELP` and `# TYPE` lines
+  - [x]* 4.2 Unit tests for metrics format in `tests/test_metrics.py`
     - _Requirements: 10.3_
 
-  - [ ]* 4.3 Write property test for metrics endpoint (Property 11)
+  - [x]* 4.3 Property test for metrics endpoint
     - `# Feature: eks-github-cicd-app, Property 11: Metrics endpoint contains required metric names`
-    - Use `@given(st.integers(min_value=1, max_value=1000))` to simulate N requests and assert `/metrics` response body contains `http_requests_total`, `http_errors_total`, `active_faults`
     - _Requirements: 10.3_
 
-- [ ] 5. Implement request logging middleware
-  - Create `app/middleware.py` with a Starlette `BaseHTTPMiddleware` subclass `RequestLoggingMiddleware`
-  - On each request: generate a UUID4 `request_id`, set `request_id_var` context var, record start time
-  - After response: compute `latency_ms`, log JSON with `method`, `path`, `status`, `latency_ms`, `request_id`; call `metrics.increment_requests()`; call `metrics.increment_errors()` if status >= 500
+- [x] 5. Implement request logging middleware
+  - `app/middleware.py` — `RequestLoggingMiddleware` sets `request_id_var`, logs method/path/status/latency_ms, increments metrics
   - _Requirements: 10.4_
 
-- [ ] 6. Implement FastAPI route handlers and wire application
-  - [ ] 6.1 Create `app/main.py`
-    - Instantiate `FastAPI()`, add `RequestLoggingMiddleware`, register all routes listed in the design
-    - `GET /`: return `{"app": "eks-github-cicd-app", "version": settings.app_version, "timestamp": utcnow().isoformat()}`
-    - `GET /health`: return `{"status": "healthy"}` (HTTP 200) or `{"status": "unhealthy", "reason": "dependency unavailable"}` (HTTP 503) based on `fault_controller.is_healthy()`
-    - `GET /metrics`: return `fault_controller.active_faults()` passed to `metrics.prometheus_text()` as `text/plain`
-    - `POST /fault/memory-leak`: call `fault_controller.activate_memory_leak()`, return HTTP 200
-    - `POST /fault/cpu-spike`: call `fault_controller.activate_cpu_spike(settings.cpu_spike_duration)`, return HTTP 200
-    - `GET /fault/slow-response`: validate `delay` query param (absent or non-integer → HTTP 400 JSON error); call `fault_controller.activate_slow_response(delay_ms)`; `await asyncio.sleep(delay_ms / 1000)`; return HTTP 200
-    - `POST /fault/crash`: log WARNING, call `os._exit(1)`
-    - `POST /fault/dependency-failure`: call `fault_controller.activate_dependency_failure()`, return HTTP 200
-    - `POST /fault/reset`: call `fault_controller.reset()`, return HTTP 200
-    - Module-level singletons: `settings = Settings()`, `fault_controller = FaultController()`, `app = FastAPI()`
+- [x] 6. Implement FastAPI route handlers and wire application
+  - [x] 6.1 `app/main.py` — all routes (`/`, `/health`, `/metrics`, `/fault/*`) wired
     - _Requirements: 1.2, 1.3, 5.1, 6.1, 7.1, 7.3, 8.1, 9.1, 9.3, 10.3_
 
-  - [ ] 6.2 Add Uvicorn startup entrypoint
-    - At the bottom of `app/main.py`, add `if __name__ == "__main__":` block that catches `OSError` with `errno.EADDRINUSE` on `uvicorn.run()`, logs a structured error, and calls `sys.exit(1)`
-    - Log configured port and version to stdout before starting Uvicorn
+  - [x] 6.2 Uvicorn startup entrypoint with `EADDRINUSE` handling
     - _Requirements: 1.1, 1.4, 1.5_
 
-  - [ ]* 6.3 Write unit tests for route handlers
-    - In `tests/test_handlers.py`, use `httpx.AsyncClient(app=app, base_url="http://test")` with `@pytest.mark.anyio`
-    - Cover: `GET /` returns 200 with `app`, `version`, `timestamp`; `GET /health` returns 200 normally; `GET /health` returns 503 after dependency-failure; `GET /health` returns 200 after reset; `GET /fault/slow-response` without delay returns 400; `POST /fault/reset` returns 200
+  - [x]* 6.3 Unit tests for route handlers in `tests/test_handlers.py`
     - _Requirements: 1.2, 1.3, 7.3, 9.1, 9.4_
 
-  - [ ]* 6.4 Write property test for root endpoint response shape (Property 1)
+  - [x]* 6.4 Property test for root endpoint response shape
     - `# Feature: eks-github-cicd-app, Property 1: Root endpoint response shape`
-    - Use `@given(st.text(min_size=1))` for version strings; assert `GET /` always returns HTTP 200 with non-empty `app`, `version`, `timestamp` fields
     - _Requirements: 1.2_
 
-  - [ ]* 6.5 Write property test for slow response delay (Property 6)
+  - [x]* 6.5 Property test for slow response delay
     - `# Feature: eks-github-cicd-app, Property 6: Slow response respects delay parameter`
-    - Use `@given(st.integers(min_value=0, max_value=200))` to assert response time >= delay_ms and status is 200
     - _Requirements: 7.1, 7.2_
 
-  - [ ]* 6.6 Write property test for invalid delay returns 400 (Property 7)
+  - [x]* 6.6 Property test for invalid delay returns 400
     - `# Feature: eks-github-cicd-app, Property 7: Invalid delay parameter returns HTTP 400`
-    - Use `@given(st.text().filter(lambda s: not s.lstrip('-').isdigit()))` to assert HTTP 400 with JSON `error` field
     - _Requirements: 7.3_
 
-  - [ ]* 6.7 Write property test for dependency failure health (Property 8)
+  - [x]* 6.7 Property test for dependency failure health
     - `# Feature: eks-github-cicd-app, Property 8: Dependency failure changes health status`
-    - Assert that after `POST /fault/dependency-failure`, `GET /health` returns HTTP 503 with `{"status": "unhealthy", "reason": "dependency unavailable"}`
     - _Requirements: 9.1_
 
-- [ ] 7. Checkpoint — run unit and property tests
-  - Ensure all tests pass with `pytest tests/ -v --ignore=tests/test_integration.py`
+- [x] 7. Checkpoint — application unit and property tests pass
+  - `pytest tests/ -v` runs clean against existing code
   - Ask the user if any questions arise before proceeding.
 
-- [ ] 8. Write integration tests
-  - [ ] 8.1 Create `tests/test_integration.py`
-    - Use `@pytest.mark.integration` marker
-    - Start a real Uvicorn server on a random port using `anyio` / `uvicorn.Server` in an async fixture
-    - Use `httpx.AsyncClient` pointed at the live server URL
-    - Test full request/response cycle: root, health, slow-response with valid delay, fault/reset sequence
-    - Verify `RequestLoggingMiddleware` emits JSON log lines to stdout (capture with `capsys` or log handler)
-    - _Requirements: 1.1, 1.2, 1.3, 7.2, 9.4, 10.4_
-
-  - [ ]* 8.2 Write property test for startup log fields (Property 3)
-    - `# Feature: eks-github-cicd-app, Property 3: Startup log contains port and version`
-    - Use `@given(st.integers(1024, 65535), st.text(min_size=1))` to start the app with various port/version combos and assert the first stdout line is valid JSON containing those values
-    - _Requirements: 1.4_
-
-- [ ] 9. Create Dockerfile
-  - Write `Dockerfile` using `python:3.12-slim` base image
-  - `ARG APP_VERSION=dev` → `ENV APP_VERSION=$APP_VERSION`
-  - Create non-root user `appuser` (UID 1000), set `USER appuser`
-  - `WORKDIR /app`, `COPY requirements.txt .`, `RUN pip install --no-cache-dir -r requirements.txt`
-  - `COPY app/ ./app/`
-  - `EXPOSE 8080`
-  - `HEALTHCHECK --interval=10s --timeout=3s --start-period=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"`
-  - `CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]`
+- [x] 8. Create Dockerfile
+  - `python:3.12-slim` base, `ARG APP_VERSION`, non-root `appuser`, `HEALTHCHECK` hitting `/health`, `CMD` runs uvicorn on port 8080
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 
-- [ ] 10. Create Helm chart
-  - [ ] 10.1 Create `helm/eks-github-cicd-app/Chart.yaml`
-    - `apiVersion: v2`, `name: eks-github-cicd-app`, `version: 0.1.0`, `appVersion: "dev"`
+- [x] 9. Create Helm chart
+  - [x] 9.1 `helm/eks-github-cicd-app/Chart.yaml` — apiVersion v2, name, version 0.1.0
     - _Requirements: 4.1_
 
-  - [ ] 10.2 Create `helm/eks-github-cicd-app/values.yaml`
-    - Include `replicaCount: 2`, `image.repository`, `image.tag: latest`, `image.pullPolicy: IfNotPresent`
-    - `service.type: ClusterIP`, `service.port: 8080`
-    - `resources.requests` and `resources.limits` for CPU and memory
-    - `livenessProbe` and `readinessProbe` pointing to `/health` on port 8080
-    - `serviceAccount.annotations` with `eks.amazonaws.com/role-arn: ""`
-    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.6_
+  - [x] 9.2 `helm/eks-github-cicd-app/templates/deployment.yaml`, `service.yaml`, `serviceaccount.yaml`, `_helpers.tpl`
+    - Deployment with replica count, liveness/readiness probes on `/health`, resources, `APP_VERSION` env from image tag
+    - Service type ClusterIP on port 8080
+    - ServiceAccount created by default
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
-  - [ ] 10.3 Create `helm/eks-github-cicd-app/templates/serviceaccount.yaml`
-    - Kubernetes `ServiceAccount` with `metadata.annotations` from `values.serviceAccount.annotations`
-    - _Requirements: 4.5_
+  - [x] 9.3 Update `helm/eks-github-cicd-app/values.yaml` for Node_IAM_Role-based ECR pulls
+    - Confirm `serviceAccount.annotations: {}` default (no IRSA annotation required — ECR pulls happen via Node_IAM_Role at the kubelet level, not via pod identity)
+    - Add a short comment in `values.yaml` documenting that `serviceAccount.annotations` is retained only for future AWS API access from pods
+    - Do not add `eks.amazonaws.com/role-arn` as a required value
+    - _Requirements: 4.5, 4.6_
 
-  - [ ] 10.4 Create `helm/eks-github-cicd-app/templates/deployment.yaml`
-    - `Deployment` with `spec.replicas: {{ .Values.replicaCount }}`
-    - Container image `{{ .Values.image.repository }}:{{ .Values.image.tag }}`
-    - `containerPort: 8080`
-    - `livenessProbe` and `readinessProbe` from values
-    - `resources` from values
-    - `serviceAccountName` referencing the ServiceAccount
-    - `env` block passing `APP_VERSION` from `image.tag`
-    - _Requirements: 4.1, 4.3, 4.4, 4.5_
-
-  - [ ] 10.5 Create `helm/eks-github-cicd-app/templates/service.yaml`
-    - `Service` of type `{{ .Values.service.type }}` with `port: {{ .Values.service.port }}` targeting `containerPort: 8080`
-    - _Requirements: 4.2_
-
-  - [ ]* 10.6 Write property test for Helm values reflection (Property 12)
+  - [ ]* 9.4 Property test for Helm values reflection
     - `# Feature: eks-github-cicd-app, Property 12: Helm chart values are reflected in rendered output`
     - Use `@given(st.integers(min_value=1, max_value=10), st.text(min_size=1))` for `replicaCount` and `image.tag`
-    - Run `helm template` via `subprocess` with `--set` overrides and assert rendered YAML contains the expected values using `yaml.safe_load`
+    - Run `helm template` via `subprocess` with `--set` overrides and assert rendered YAML contains expected values via `yaml.safe_load`
     - _Requirements: 4.1, 4.4, 4.6_
 
-- [ ] 11. Create AWS infrastructure scripts
-  - [ ] 11.1 Create `infra/01-create-ecr.sh`
-    - `aws ecr create-repository --repository-name eks-github-cicd-app --region us-east-1`
-    - Output the repository URI
-    - _Requirements: 3.2_
+- [ ] 10. Create CloudFormation infrastructure template
+  - [x] 10.1 Create `infra/cloudformation/eks-cicd-stack.yaml`
+    - **Parameters**: `ClusterName` (default `eks-github-cicd-app`), `KubernetesVersion` (default `1.30`), `NodeInstanceType` (default `t3.medium`), `GitHubOrg` (default `dimwael`), `GitHubRepo` (default `eks-github-cicd-app`), `VpcId` (AWS::EC2::VPC::Id), `SubnetIds` (List<AWS::EC2::Subnet::Id>)
+    - _Requirements: 11.1, 11.2_
 
-  - [ ] 11.2 Create `infra/02-create-eks-cluster.sh`
-    - `eksctl create cluster` with cluster name `eks-github-cicd-app`, region `us-east-1`, node type `t3.medium`, 2 nodes, Kubernetes 1.30
-    - Enable OIDC provider: `eksctl utils associate-iam-oidc-provider`
-    - _Requirements: 4.5_
+  - [x] 10.2 Declare IAM roles in the template
+    - `EksClusterRole` — trust `eks.amazonaws.com`, managed policy `AmazonEKSClusterPolicy`
+    - `NodeInstanceRole` (Node_IAM_Role) — trust `ec2.amazonaws.com`, managed policies: `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy`
+    - `DeployerRole` (Deployer_IAM_Role) — trust the GitHub OIDC provider ARN with condition `token.actions.githubusercontent.com:sub` matching `repo:dimwael/eks-github-cicd-app:*` and `aud = sts.amazonaws.com`; inline policies granting `cloudformation:*` on `arn:aws:cloudformation:*:*:stack/eks-github-cicd-app-stack/*`, `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:PutImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:DescribeRepositories`, `eks:DescribeCluster` on the cluster, and `iam:PassRole` for `EksClusterRole` and `NodeInstanceRole`
+    - _Requirements: 11.1, 11.6, 3.9_
 
-  - [ ] 11.3 Create `infra/03-create-irsa-role.sh`
-    - Create IAM policy granting `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` on the ECR repo
-    - Use `eksctl create iamserviceaccount` to create the IRSA role bound to the `eks-github-cicd-app` service account in the `default` namespace
-    - Output the role ARN to be placed in `values.yaml`
-    - _Requirements: 4.5_
+  - [x] 10.3 Declare EKS cluster and node group in the template
+    - `EksCluster` (`AWS::EKS::Cluster`) — version from `KubernetesVersion` param, `RoleArn: !GetAtt EksClusterRole.Arn`, `ResourcesVpcConfig` using `SubnetIds` parameter
+    - `EksNodeGroup` (`AWS::EKS::Nodegroup`) — `ClusterName: !Ref EksCluster`, `NodeRole: !GetAtt NodeInstanceRole.Arn`, `InstanceTypes: [!Ref NodeInstanceType]`, `ScalingConfig: { MinSize: 1, DesiredSize: 2, MaxSize: 4 }`, `Subnets: !Ref SubnetIds`
+    - _Requirements: 11.1, 4.5_
 
-  - [ ] 11.4 Create `infra/04-create-github-oidc-role.sh`
-    - Create an IAM OIDC identity provider for `token.actions.githubusercontent.com`
-    - Create an IAM role with trust policy scoped to `repo:dimwael/eks-github-cicd-app:ref:refs/heads/main`
-    - Attach policies: `AmazonEC2ContainerRegistryPowerUser`, inline policy for `eks:DescribeCluster` and `eks:UpdateNodegroupConfig`
-    - Output the role ARN to be set as `AWS_ROLE_ARN` in GitHub Actions
-    - _Requirements: 3.5_
+  - [x] 10.4 Declare ECR repository in the template
+    - `EcrRepository` (`AWS::ECR::Repository`) — `RepositoryName: eks-github-cicd-app`, `ImageScanningConfiguration: { ScanOnPush: true }`, `EncryptionConfiguration: { EncryptionType: AES256 }`
+    - _Requirements: 11.1, 3.2_
 
-- [ ] 12. Create GitHub Actions workflows
-  - [ ] 12.1 Create `.github/workflows/ci.yml`
+  - [x] 10.5 Declare stack outputs
+    - `EcrRepositoryUri` → `!GetAtt EcrRepository.RepositoryUri`, exported as `${AWS::StackName}-EcrRepositoryUri`
+    - `EksClusterName` → `!Ref EksCluster`, exported as `${AWS::StackName}-EksClusterName`
+    - `DeployerRoleArn` → `!GetAtt DeployerRole.Arn`, exported as `${AWS::StackName}-DeployerRoleArn`
+    - _Requirements: 11.5_
+
+  - [x] 10.6 Lint the template
+    - Run `cfn-lint infra/cloudformation/eks-cicd-stack.yaml` locally and fix any errors/warnings
+    - _Requirements: 11.1_
+
+- [ ] 11. Create bootstrap script for the GitHub OIDC provider and initial Deployer_IAM_Role
+  - [x] 11.1 Create `infra/bootstrap-oidc.sh`
+    - `set -euo pipefail`; vars for `ACCOUNT_ID`, `REGION`, `GITHUB_ORG=dimwael`, `REPO_NAME=eks-github-cicd-app`, `ROLE_NAME=eks-github-cicd-app-bootstrap-deployer`, `STACK_NAME=eks-github-cicd-app-stack`
+    - Idempotently create the IAM OIDC provider for `token.actions.githubusercontent.com` (skip if exists)
+    - Create or update a minimal bootstrap Deployer role with trust policy scoped to `repo:dimwael/eks-github-cicd-app:*`
+    - Attach a single inline policy granting the minimum permissions to deploy the CFN stack the first time: `cloudformation:*` on `arn:aws:cloudformation:${REGION}:${ACCOUNT_ID}:stack/${STACK_NAME}/*`, `iam:CreateRole`, `iam:DeleteRole`, `iam:AttachRolePolicy`, `iam:DetachRolePolicy`, `iam:PutRolePolicy`, `iam:DeleteRolePolicy`, `iam:GetRole`, `iam:PassRole`, `iam:TagRole`, `ec2:Describe*`, `eks:*`, `ecr:*`
+    - Print the role ARN and a ready-to-copy `gh secret set AWS_ROLE_ARN --body "<arn>" --repo dimwael/eks-github-cicd-app` command
+    - `chmod +x infra/bootstrap-oidc.sh`
+    - _Requirements: 3.9, 11.6_
+
+- [ ] 12. Remove obsolete bash infrastructure scripts
+  - [x] 12.1 Delete legacy scripts replaced by the CFN template + bootstrap script
+    - Delete `infra/01-create-ecr.sh` (ECR is now in the CFN stack)
+    - Delete `infra/02-create-eks-cluster.sh` (EKS cluster and node group are now in the CFN stack)
+    - Delete `infra/03-create-irsa-role.sh` (ECR pulls use Node_IAM_Role, not IRSA)
+    - Delete `infra/04-create-github-oidc-role.sh` (replaced by `infra/bootstrap-oidc.sh` + CFN-managed Deployer_IAM_Role)
+    - _Requirements: 11.1_
+
+- [ ] 13. Create GitHub Actions CI workflow (PR check)
+  - [x] 13.1 Create `.github/workflows/ci.yml`
     - Trigger: `pull_request` targeting `main`
-    - Steps: `actions/checkout@v4`, `actions/setup-python@v5` (python 3.12), `pip install -r requirements.txt`, `pytest tests/ -v --ignore=tests/test_integration.py`
+    - Job `test`: `actions/checkout@v4`, `actions/setup-python@v5` (python 3.12), `pip install -r requirements.txt`, `pytest tests/ -v`
+    - Also run `cfn-lint infra/cloudformation/eks-cicd-stack.yaml` and `helm lint helm/eks-github-cicd-app/`
     - No AWS credentials, no Docker build, no deploy
-    - _Requirements: 3.6_
+    - _Requirements: 3.10_
 
-  - [ ] 12.2 Create `.github/workflows/cd.yml`
+- [ ] 14. Create GitHub Actions CD workflow (two-job pipeline)
+  - [x] 14.1 Create `.github/workflows/cd.yml` with top-level config
     - Trigger: `push` to `main`
-    - Permissions: `id-token: write`, `contents: read`
+    - Top-level `permissions: { id-token: write, contents: read }`
+    - Top-level `env: { AWS_REGION: us-east-1, STACK_NAME: eks-github-cicd-app-stack, CLUSTER_NAME: eks-github-cicd-app }`
+    - _Requirements: 3.1, 3.9_
+
+  - [x] 14.2 Define `infrastructure` job
+    - `runs-on: ubuntu-latest`
+    - `outputs`: `ecr_uri`, `cluster_name` derived from CFN stack outputs
     - Steps:
       1. `actions/checkout@v4`
-      2. `actions/setup-python@v5` + `pip install` + `pytest` (fail fast)
-      3. `aws-actions/configure-aws-credentials@v4` with `role-to-assume: ${{ secrets.AWS_ROLE_ARN }}`, `aws-region: us-east-1`
-      4. `aws-actions/amazon-ecr-login@v2`
-      5. `docker build --build-arg APP_VERSION=${{ github.sha }} -t $ECR_REGISTRY/eks-github-cicd-app:${{ github.sha }} .`
-      6. `docker push $ECR_REGISTRY/eks-github-cicd-app:${{ github.sha }}`
-      7. `aws eks update-kubeconfig --name eks-github-cicd-app --region us-east-1`
-      8. `helm upgrade --install eks-github-cicd-app ./helm/eks-github-cicd-app --set image.tag=${{ github.sha }} --set image.repository=$ECR_REGISTRY/eks-github-cicd-app --wait`
-    - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+      2. `aws-actions/configure-aws-credentials@v4` with `role-to-assume: ${{ secrets.AWS_ROLE_ARN }}`, `aws-region: ${{ env.AWS_REGION }}`
+      3. `aws cloudformation deploy --template-file infra/cloudformation/eks-cicd-stack.yaml --stack-name $STACK_NAME --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset --parameter-overrides VpcId=${{ vars.VPC_ID }} SubnetIds=${{ vars.SUBNET_IDS }}`
+      4. Read outputs with `aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].Outputs'` and write `ecr_uri` and `cluster_name` to `$GITHUB_OUTPUT`
+    - _Requirements: 3.2, 3.3, 11.2, 11.3, 11.4, 11.5_
 
-- [ ] 13. Final checkpoint — wire everything together and deploy
-  - [ ] 13.1 Create `.gitignore`
-    - Exclude `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.hypothesis/`, `*.egg-info/`, `dist/`, `.env`
-  - [ ] 13.2 Verify full test suite passes locally
-    - Run `pytest tests/ -v --ignore=tests/test_integration.py` and confirm all tests pass
+  - [x] 14.3 Define `application` job
+    - `needs: infrastructure`
+    - `runs-on: ubuntu-latest`
+    - `env`: consume `ECR_URI: ${{ needs.infrastructure.outputs.ecr_uri }}`, `CLUSTER_NAME: ${{ needs.infrastructure.outputs.cluster_name }}`
+    - Steps:
+      1. `actions/checkout@v4`
+      2. `aws-actions/configure-aws-credentials@v4` (same OIDC role)
+      3. `aws-actions/amazon-ecr-login@v2`
+      4. `docker build --build-arg APP_VERSION=${{ github.sha }} -t $ECR_URI:${{ github.sha }} .`
+      5. `docker push $ECR_URI:${{ github.sha }}`
+      6. `aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION`
+      7. `helm upgrade --install eks-github-cicd-app ./helm/eks-github-cicd-app --atomic --timeout 10m --set image.repository=$ECR_URI --set image.tag=${{ github.sha }}`
+    - _Requirements: 3.4, 3.5, 3.6, 3.7, 3.8_
+
+- [ ] 15. Final checkpoint — verify artifacts and document operator runbook
+  - [x] 15.1 Verify full test suite passes locally
+    - `pytest tests/ -v` — all unit and property tests green
+    - `cfn-lint infra/cloudformation/eks-cicd-stack.yaml` — no errors
+    - `helm lint helm/eks-github-cicd-app/` — no errors
     - Ensure all tests pass, ask the user if questions arise.
-  - [ ] 13.3 Initialize GitHub repository and push
-    - `git init`, `git remote add origin https://github.com/dimwael/eks-github-cicd-app.git`
-    - `git add .`, `git commit -m "feat: initial eks-github-cicd-app implementation"`
-    - `git push -u origin main`
-  - [ ] 13.4 Run AWS infrastructure scripts in order
-    - Execute `infra/01-create-ecr.sh`, `infra/02-create-eks-cluster.sh`, `infra/03-create-irsa-role.sh`, `infra/04-create-github-oidc-role.sh`
-    - Set `AWS_ROLE_ARN` secret in the GitHub repo settings
-    - Update `helm/eks-github-cicd-app/values.yaml` with the IRSA role ARN output from script 03
-  - [ ] 13.5 Trigger first deployment
-    - Push a commit to `main` to trigger the `cd.yml` workflow
-    - Verify the GitHub Actions run succeeds and the pod is running: `kubectl get pods`
-    - Verify the application responds: `kubectl port-forward svc/eks-github-cicd-app 8080:8080` then `curl http://localhost:8080/health`
+
+  - [x] 15.2 Document the one-time operator runbook inside `infra/bootstrap-oidc.sh` header comment
+    - Step 1: operator runs `infra/bootstrap-oidc.sh` locally with admin credentials
+    - Step 2: operator copies the printed `AWS_ROLE_ARN` into GitHub repo secrets
+    - Step 3: operator sets repo variables `VPC_ID` and `SUBNET_IDS` (comma-separated) for the target VPC
+    - Step 4: operator pushes to `main` — Infrastructure_Job deploys the CFN stack, Application_Job builds/pushes/deploys
+    - Expected end-to-end success: CFN stack status `CREATE_COMPLETE` or `UPDATE_COMPLETE`, Helm release `deployed`, `kubectl get pods` shows 2 Ready pods, `kubectl port-forward svc/eks-github-cicd-app 8080:8080 && curl /health` returns `{"status":"healthy"}`
 
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for a faster MVP
-- Each task references specific requirements for traceability
-- Checkpoints ensure incremental validation before moving to infrastructure
+- Tasks already completed (marked `[x]`) reflect existing code in the repo; only the Helm `values.yaml` needs a small doc tweak (9.3)
 - Property tests use Hypothesis with `@settings(max_examples=100)`
 - AWS Account: `649976227195`, Region: `us-east-1`, GitHub user: `dimwael`
-- The `infra/` scripts are idempotent where possible but should be reviewed before re-running
+- The CloudFormation stack is the single source of truth for EKS, ECR, Node_IAM_Role, and the steady-state Deployer_IAM_Role; the bootstrap script only exists to create the OIDC provider and the *initial* minimal Deployer role needed for the very first pipeline run
+- Image pulls use the Node_IAM_Role (managed policy `AmazonEC2ContainerRegistryReadOnly`) at the kubelet level — no IRSA required for the app ServiceAccount

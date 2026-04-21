@@ -1,3 +1,36 @@
+# =============================================================================
+# CD — deploy infrastructure and application on every push to main.
+#
+# Two sequential jobs:
+#
+#   1. infrastructure
+#      - Authenticates to AWS via GitHub OIDC (no long-lived secrets).
+#      - Deploys infra/cloudformation/eks-cicd-stack.yaml as a CloudFormation
+#        stack. On first run this creates the EKS cluster, node group, ECR
+#        repository, Node_IAM_Role, and Deployer_IAM_Role. On subsequent runs
+#        CloudFormation reconciles drift idempotently.
+#      - Exports the stack outputs (ECR URI, cluster name) as job outputs
+#        so the application job can consume them.
+#
+#   2. application (needs: infrastructure)
+#      - Only runs if infrastructure succeeded.
+#      - Builds the Docker image tagged with the git commit SHA.
+#      - Pushes to ECR.
+#      - Runs `helm upgrade --install --atomic --timeout 10m` against the
+#        EKS cluster. --atomic automatically rolls back the release if the
+#        new pods don't reach a ready state within 10 minutes.
+#
+# Required GitHub repo secrets:
+#   - AWS_ROLE_ARN           ARN of the Deployer role (bootstrap role on first
+#                            run, stack-managed Deployer_IAM_Role afterwards)
+#
+# Required GitHub repo variables:
+#   - AWS_OIDC_PROVIDER_ARN  ARN of the GitHub Actions OIDC identity provider
+#                            (created by infra/bootstrap-oidc.sh)
+#   - VPC_ID                 VPC the EKS cluster and nodes run in
+#   - SUBNET_IDS             comma-separated list of subnet IDs (>= 2 AZs)
+# =============================================================================
+
 name: CD
 
 on:
@@ -10,68 +43,110 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REGISTRY: 649976227195.dkr.ecr.us-east-1.amazonaws.com
-  ECR_REPOSITORY: eks-github-cicd-app
-  EKS_CLUSTER: eks-github-cicd-app
+  STACK_NAME: eks-github-cicd-app-stack
+  CLUSTER_NAME: eks-github-cicd-app
+  GITHUB_ORG: dimwael
+  REPO_NAME: eks-github-cicd-app
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run tests
-        run: pytest tests/ -v --ignore=tests/test_integration.py
-
-  build-push:
-    needs: test
+  # ---------------------------------------------------------------------------
+  # Infrastructure_Job — reconciles AWS resources via CloudFormation.
+  # ---------------------------------------------------------------------------
+  infrastructure:
+    name: Deploy infrastructure
     runs-on: ubuntu-latest
     outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
+      ecr_uri: ${{ steps.outputs.outputs.ecr_uri }}
+      cluster_name: ${{ steps.outputs.outputs.cluster_name }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Login to ECR
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/cloudformation/eks-cicd-stack.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ClusterName="$CLUSTER_NAME" \
+              GitHubOrg="$GITHUB_ORG" \
+              GitHubRepo="$REPO_NAME" \
+              SubnetIds="${{ vars.SUBNET_IDS }}" \
+              GitHubOIDCProviderArn="${{ vars.AWS_OIDC_PROVIDER_ARN }}"
+
+      - name: Read stack outputs
+        id: outputs
+        run: |
+          ECR_URI=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" \
+            --output text)
+          CLUSTER_NAME_OUT=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='EksClusterName'].OutputValue" \
+            --output text)
+          echo "ecr_uri=${ECR_URI}" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=${CLUSTER_NAME_OUT}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ECR URI: ${ECR_URI}"
+          echo "Resolved cluster: ${CLUSTER_NAME_OUT}"
+
+  # ---------------------------------------------------------------------------
+  # Application_Job — builds, pushes, and deploys the container image.
+  # ---------------------------------------------------------------------------
+  application:
+    name: Build, push, and deploy
+    needs: infrastructure
+    runs-on: ubuntu-latest
+    env:
+      ECR_URI: ${{ needs.infrastructure.outputs.ecr_uri }}
+      CLUSTER_NAME_OUT: ${{ needs.infrastructure.outputs.cluster_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
-      - name: Set image tag
-        id: meta
-        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
-      - name: Build and push
+
+      - name: Build Docker image
         run: |
           docker build \
-            --build-arg APP_VERSION=${{ github.sha }} \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --build-arg APP_VERSION="${{ github.sha }}" \
+            -t "$ECR_URI:${{ github.sha }}" \
+            -t "$ECR_URI:latest" \
             .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-  deploy:
-    needs: build-push
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: Push Docker image to ECR
+        run: |
+          docker push "$ECR_URI:${{ github.sha }}"
+          docker push "$ECR_URI:latest"
+
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
-      - name: Install Helm
-        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-      - name: Deploy
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME_OUT" --region "$AWS_REGION"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: Deploy with Helm (atomic, auto-rollback on failure)
         run: |
           helm upgrade --install eks-github-cicd-app ./helm/eks-github-cicd-app \
-            --set image.tag=${{ github.sha }} \
-            --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
-            --wait \
-            --timeout 5m
+            --atomic \
+            --timeout 10m \
+            --set image.repository="$ECR_URI" \
+            --set image.tag="${{ github.sha }}" \
+            --wait
