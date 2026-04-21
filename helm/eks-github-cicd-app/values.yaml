@@ -6,8 +6,16 @@ image:
   pullPolicy: IfNotPresent
 
 service:
-  type: ClusterIP
-  port: 8080
+  # LoadBalancer exposes the app publicly via a classic ELB provisioned
+  # automatically by the EKS in-tree cloud provider. This costs ~$18/month
+  # on top of the cluster itself. Switch to ClusterIP if you want to keep
+  # the app internal-only.
+  type: LoadBalancer
+  port: 80
+  annotations:
+    # Use a Network Load Balancer (faster, cheaper, L4) rather than the
+    # default Classic Load Balancer.
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
 
 resources:
   requests:
