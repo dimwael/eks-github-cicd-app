@@ -285,6 +285,32 @@ Resources:
                   - iam:ListAttachedRolePolicies
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ClusterName}-*'
 
+        # EKS creates service-linked roles in the aws-service-role path the
+        # first time a cluster / node group / fargate profile is created.
+        # The Deployer needs read access to detect whether they already
+        # exist and permission to create them if not.
+        - PolicyName: EksServiceLinkedRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/eks.amazonaws.com/AWSServiceRoleForAmazonEKS'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/eks-nodegroup.amazonaws.com/AWSServiceRoleForAmazonEKSNodegroup'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/eks-fargate.amazonaws.com/AWSServiceRoleForAmazonEKSForFargate'
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - eks.amazonaws.com
+                      - eks-nodegroup.amazonaws.com
+                      - eks-fargate.amazonaws.com
+
         # Read-only EC2 describe calls are needed for VPC/subnet/security
         # group lookups during stack deploys.
         - PolicyName: Ec2Describe

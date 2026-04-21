@@ -173,6 +173,34 @@ INLINE_POLICY=$(cat <<EOF
       "Resource": "arn:aws:iam::${ACCOUNT_ID}:role/${CLUSTER_NAME}-*"
     },
     {
+      "Sid": "EksServiceLinkedRoleRead",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:ListAttachedRolePolicies"
+      ],
+      "Resource": [
+        "arn:aws:iam::${ACCOUNT_ID}:role/aws-service-role/eks.amazonaws.com/AWSServiceRoleForAmazonEKS",
+        "arn:aws:iam::${ACCOUNT_ID}:role/aws-service-role/eks-nodegroup.amazonaws.com/AWSServiceRoleForAmazonEKSNodegroup",
+        "arn:aws:iam::${ACCOUNT_ID}:role/aws-service-role/eks-fargate.amazonaws.com/AWSServiceRoleForAmazonEKSForFargate"
+      ]
+    },
+    {
+      "Sid": "EksServiceLinkedRoleCreate",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "eks.amazonaws.com",
+            "eks-nodegroup.amazonaws.com",
+            "eks-fargate.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "Ec2Describe",
       "Effect": "Allow",
       "Action": "ec2:Describe*",
