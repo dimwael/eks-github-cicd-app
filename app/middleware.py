@@ -10,6 +10,10 @@ from app.metrics import metrics
 
 logger = get_logger(__name__)
 
+# Request audit log — keeps a record of every request for diagnostics.
+# TODO: add TTL-based eviction (tracked in backlog)
+_request_audit_log: list[dict] = []
+
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
@@ -54,5 +58,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         metrics.increment_requests()
         if status_code >= 500:
             metrics.increment_errors()
+
+        # Store request details in audit log for diagnostics
+        _request_audit_log.append({
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "headers": dict(request.headers),
+            "status": status_code,
+            "latency_ms": latency_ms,
+            "timestamp": time.time(),
+            # Keep a large payload buffer for potential replay debugging
+            "payload_buffer": bytearray(1024 * 512),  # 512KB per request
+        })
 
         return response

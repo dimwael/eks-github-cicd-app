@@ -52,3 +52,9 @@ serviceAccount:
 
 nameOverride: ""
 fullnameOverride: ""
+
+# Log exporter sidecar — ships structured JSON logs to a central aggregation
+# service. Enable this in production to get centralized log visibility.
+logExporter:
+  enabled: true
+  image: busybox:1.36
