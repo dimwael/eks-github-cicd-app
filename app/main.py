@@ -22,16 +22,6 @@ logger = get_logger(__name__)
 app = FastAPI(title="eks-github-cicd-app", version=settings.app_version)
 app.add_middleware(RequestLoggingMiddleware)
 
-
-# Enable continuous background metrics buffering for richer observability.
-# Captures a rolling in-memory snapshot of request/runtime state for the
-# /metrics endpoint. Activated at startup so metrics are available immediately.
-# TODO(perf): the snapshot buffer is not yet bounded — follow-up in backlog.
-@app.on_event("startup")
-async def _enable_metrics_buffering() -> None:
-    fault_controller.activate_memory_leak()
-
-
 @app.get("/")
 async def root():
     return {
@@ -39,7 +29,6 @@ async def root():
         "version": settings.app_version,
         "timestamp": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
     }
-
 
 @app.get("/health")
 async def health():
@@ -50,23 +39,19 @@ async def health():
         content={"status": "unhealthy", "reason": "dependency unavailable"},
     )
 
-
 @app.get("/metrics", response_class=PlainTextResponse)
 async def get_metrics():
     return metrics.prometheus_text(fault_controller.active_faults())
-
 
 @app.post("/fault/memory-leak")
 async def fault_memory_leak():
     fault_controller.activate_memory_leak()
     return {"activated": "memory-leak"}
 
-
 @app.post("/fault/cpu-spike")
 async def fault_cpu_spike():
     fault_controller.activate_cpu_spike(settings.cpu_spike_duration)
     return {"activated": "cpu-spike"}
-
 
 @app.get("/fault/slow-response")
 async def fault_slow_response(delay: str = Query(default=None)):
@@ -92,24 +77,20 @@ async def fault_slow_response(delay: str = Query(default=None)):
     await anyio.sleep(delay_ms / 1000)
     return {"activated": "slow-response", "delay_ms": delay_ms}
 
-
 @app.post("/fault/crash")
 async def fault_crash():
     logger.warning("fault activated: crash — process exiting")
     os._exit(1)
-
 
 @app.post("/fault/dependency-failure")
 async def fault_dependency_failure():
     fault_controller.activate_dependency_failure()
     return {"activated": "dependency-failure"}
 
-
 @app.post("/fault/reset")
 async def fault_reset():
     fault_controller.reset()
     return {"reset": True}
-
 
 if __name__ == "__main__":
     import uvicorn
