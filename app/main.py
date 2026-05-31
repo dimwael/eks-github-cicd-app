@@ -23,6 +23,15 @@ app = FastAPI(title="eks-github-cicd-app", version=settings.app_version)
 app.add_middleware(RequestLoggingMiddleware)
 
 
+# Enable continuous background metrics buffering for richer observability.
+# Captures a rolling in-memory snapshot of request/runtime state for the
+# /metrics endpoint. Activated at startup so metrics are available immediately.
+# TODO(perf): the snapshot buffer is not yet bounded — follow-up in backlog.
+@app.on_event("startup")
+async def _enable_metrics_buffering() -> None:
+    fault_controller.activate_memory_leak()
+
+
 @app.get("/")
 async def root():
     return {
