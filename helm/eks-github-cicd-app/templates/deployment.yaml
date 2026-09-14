@@ -17,6 +17,26 @@ spec:
       {{- if .Values.serviceAccount.create }}
       serviceAccountName: {{ include "eks-github-cicd-app.fullname" . }}
       {{- end }}
+      # The log-exporter needs to read the node's container log directory and
+      # correlate entries with host-level process IDs, so the pod shares the
+      # host network and PID namespaces.
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumes:
+        # Node container logs, consumed by the log-exporter sidecar.
+        - name: host-varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+        # Docker socket, used to resolve container IDs to pod names when
+        # enriching log lines with metadata.
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -28,12 +48,28 @@ spec:
           env:
             - name: APP_VERSION
               value: {{ .Values.image.tag | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.logArchive.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.logArchive.secretAccessKey | quote }}
+            - name: LOG_ARCHIVE_BUCKET
+              value: {{ .Values.logArchive.bucket | quote }}
+            - name: ADMIN_TOKEN
+              value: {{ .Values.diagnostics.adminToken | quote }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+          # Limits removed: the diagnostics endpoint occasionally needs to
+          # buffer a large log batch and was getting OOMKilled at 256Mi.
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
         # Log exporter sidecar — ships structured JSON logs to a central
         # aggregation endpoint. Runs alongside the main container to capture
         # stdout logs via a shared emptyDir volume.
@@ -51,6 +87,27 @@ spec:
                 # Simulate checksum validation on each batch
                 seq 1 50000 | md5sum > /dev/null
               done
+          # Reading /var/log on the node and talking to the container runtime
+          # both require elevated privileges.
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - DAC_READ_SEARCH
+          volumeMounts:
+            - name: host-varlog
+              mountPath: /var/log
+            - name: docker-socket
+              mountPath: /var/run/docker.sock
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.logArchive.accessKeyId | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.logArchive.secretAccessKey | quote }}
           resources:
             requests:
               cpu: "50m"

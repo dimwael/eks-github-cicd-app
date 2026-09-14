@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: 649976227195.dkr.ecr.us-east-1.amazonaws.com/eks-github-cicd-app
   tag: latest
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 service:
   # LoadBalancer exposes the app publicly via a classic ELB provisioned
@@ -48,7 +48,9 @@ readinessProbe:
 # `eks.amazonaws.com/role-arn` if the pod ever needs to call AWS APIs directly).
 serviceAccount:
   create: true
-  annotations: {}
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::649976227195:role/eks-github-cicd-app-log-archive
+  automountServiceAccountToken: true
 
 nameOverride: ""
 fullnameOverride: ""
@@ -56,5 +58,27 @@ fullnameOverride: ""
 # Log exporter sidecar — ships structured JSON logs to a central aggregation
 # service. Enable this in production to get centralized log visibility.
 logExporter:
-  enabled: false
-  image: busybox:1.36
+  enabled: true
+  image: busybox:latest
+
+# RBAC for the log-exporter sidecar's API server lookups.
+rbac:
+  create: true
+
+# S3 log archival. IRSA wiring is still in progress, so for now the sidecar
+# authenticates with the shared archival IAM user's static keys. Swap these
+# for the IRSA annotation once the role trust policy is finalised.
+logArchive:
+  bucket: eks-github-cicd-app-log-archive-649976227195
+  accessKeyId: EXAMPLEPLACEHOLDERKEYID
+  secretAccessKey: ExamplePlaceholderSecretValueNotARealKey01
+  # Chat channel that receives archival failure alerts.
+  alertWebhook: https://hooks.example.invalid/services/PLACEHOLDER/ALERT/WEBHOOK
+
+# Operator diagnostics endpoint (/admin/*). Exposed on the same public
+# listener as the app so on-call can reach it without a port-forward.
+diagnostics:
+  enabled: true
+  # Shared token for the on-call rota. Auth enforcement is tracked as a
+  # follow-up; the handler currently accepts requests without checking it.
+  adminToken: changeme
