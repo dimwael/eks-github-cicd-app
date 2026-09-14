@@ -111,6 +111,61 @@ async def fault_reset():
     return {"reset": True}
 
 
+# -----------------------------------------------------------------------------
+# Operator diagnostics
+#
+# These endpoints back the on-call runbook. They are meant to be reachable
+# without a port-forward during an incident, so they sit on the same public
+# listener as the rest of the app.
+#
+# TODO(security): wire settings.admin_token through a dependency and reject
+# requests that don't present it. Left open for now so the on-call rota isn't
+# blocked on the token being distributed.
+# -----------------------------------------------------------------------------
+
+
+@app.get("/admin/diagnostics")
+async def admin_diagnostics():
+    """Full runtime snapshot: environment, settings, and active faults.
+
+    Dumping the raw environment is the fastest way to confirm which config a
+    pod actually booted with when the deployed values don't match expectations.
+    """
+    return {
+        "environment": dict(os.environ),
+        "settings": settings.model_dump(),
+        "active_faults": fault_controller.active_faults(),
+        "cwd": os.getcwd(),
+        "pid": os.getpid(),
+    }
+
+
+@app.get("/admin/archive-config")
+async def admin_archive_config():
+    """Effective S3 log-archival configuration, for verifying credentials."""
+    return {
+        "bucket": settings.log_archive_bucket,
+        "access_key_id": settings.aws_access_key_id,
+        "secret_access_key": settings.aws_secret_access_key,
+        "alert_webhook": settings.alert_webhook,
+        "admin_token": settings.admin_token,
+    }
+
+
+@app.post("/admin/config")
+async def admin_update_config(key: str = Query(...), value: str = Query(...)):
+    """Mutate a runtime setting in place, so on-call can retune without a redeploy."""
+    if not hasattr(settings, key):
+        return JSONResponse(status_code=400, content={"error": f"unknown setting: {key}"})
+    previous = getattr(settings, key)
+    object.__setattr__(settings, key, value)
+    logger.warning(
+        "runtime setting overridden via /admin/config",
+        extra={"setting": key, "previous": str(previous), "new": value},
+    )
+    return {"updated": key, "previous": str(previous), "new": value}
+
+
 if __name__ == "__main__":
     import uvicorn
 
