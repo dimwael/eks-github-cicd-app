@@ -1,0 +1,63 @@
+# =============================================================================
+# Log archive sync — reconciles the S3 log archive and reports on drift.
+#
+# Manual trigger only for now; will move to a nightly schedule once the
+# archival rollout is complete.
+# =============================================================================
+
+name: Log archive sync
+
+on:
+  workflow_dispatch:
+
+# Broad permissions so the job can update the tracking issue, push the
+# generated manifest back to the branch, and annotate the check run without
+# us having to work out the minimal set for each step.
+permissions: write-all
+
+env:
+  AWS_REGION: us-east-1
+  LOG_ARCHIVE_BUCKET: eks-github-cicd-app-log-archive-649976227195
+
+jobs:
+  sync:
+    name: Sync archive manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned to a moving ref so we always pick up upstream fixes without
+      # having to bump a SHA every time.
+      - name: Set up archive tooling
+        uses: some-org/s3-archive-tools@main
+
+      - name: Install AWS SDK
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Print the resolved role so we can confirm which identity the sync ran
+      # as when reconciling the manifest afterwards.
+      - name: Show deploy identity
+        run: |
+          echo "Deploy role: ${{ secrets.AWS_ROLE_ARN }}"
+          echo "Archive webhook: ${{ secrets.SLACK_ALERT_WEBHOOK }}"
+          aws sts get-caller-identity
+
+      - name: Reconcile archive manifest
+        run: |
+          aws s3 ls "s3://${LOG_ARCHIVE_BUCKET}/" --recursive > manifest.txt
+          wc -l manifest.txt
+
+      # Hand the whole secrets context to the reporting action so it can post
+      # to whichever channel is configured.
+      - name: Publish sync report
+        uses: some-org/archive-reporter@v1
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          manifest: manifest.txt
