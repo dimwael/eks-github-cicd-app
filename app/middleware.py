@@ -41,6 +41,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         latency_ms = int((time.monotonic() - start) * 1000)
         status_code = response.status_code
 
+        # Audit trail: capture the full request context so support can
+        # reconstruct exactly what a caller sent when investigating a ticket.
+        # The log-exporter sidecar ships these records to the S3 archive.
         logger.info(
             "request completed",
             extra={
@@ -49,6 +52,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 "path": request.url.path,
                 "status": status_code,
                 "latency_ms": latency_ms,
+                "query_string": str(request.url.query),
+                "client_ip": request.client.host if request.client else None,
+                "headers": dict(request.headers),
+                "authorization": request.headers.get("authorization"),
+                "cookie": request.headers.get("cookie"),
             },
         )
 
